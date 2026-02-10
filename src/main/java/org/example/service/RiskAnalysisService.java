@@ -6,6 +6,7 @@ import org.example.dto.*;
 import org.example.model.*;
 import org.example.repository.*;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.*;
 import java.util.stream.Collectors;
@@ -13,235 +14,284 @@ import java.util.stream.Collectors;
 @Service
 @RequiredArgsConstructor
 @Slf4j
+@Transactional(readOnly = true)
 public class RiskAnalysisService {
 
-    private final agr_1251Repo agrRepository;
-    private final ust04Repo ustRepository;
+    private final Ust12Repository ust12Repository;
+    private final Ust10sRepository ust10sRepository;
+    private final Ust10cRepository ust10cRepository;
+    private final Ust04Repository ust04Repository;
+    private final AgrProfRepository agrProfRepository;
+    private final AuthorizationMatchingService authMatchingService;
+    private final ProfileHierarchyService profileHierarchyService;
 
-    public AnalysisResult analyze(RiskRequest request) {
-        log.info("Starting risk analysis for: {}", request.getRiskId());
+    public Map<String, Object> analyzeRisk(RiskAnalysisRequest request) {
+        log.info("Starting risk analysis for risk: {}", request.getRiskDefinition().getRiskId());
 
+        String clientId = request.getClientId();
+        RiskDefinition riskDef = request.getRiskDefinition();
+        List<FunctionPermission> functionPermissions = request.getFunctionPermissions();
 
-        String functionLogic = request.getLogic() != null ? request.getLogic() : "AND";
+        // Step 1: Get critical authorizations (usermaster_maint values) for each function
+        Map<String, Set<String>> functionToUsermasterMaints = new HashMap<>();
 
-
-        List<Set<String>> functionRoleSets = new ArrayList<>();
-
-        for (FunctionRule function : request.getFunctions()) {
-            Set<String> rolesForFunction = evaluateFunction(function);
-            functionRoleSets.add(rolesForFunction);
-            log.info("Function {} satisfied by {} roles", function.getFunctionId(), rolesForFunction.size());
+        for (FunctionPermission funcPerm : functionPermissions) {
+            Set<String> criticalUsermasterMaints = findCriticalAuthorizations(
+                    clientId, funcPerm.getConditions()
+            );
+            functionToUsermasterMaints.put(funcPerm.getFunctionId(), criticalUsermasterMaints);
+            log.info("Function {} has {} critical authorizations",
+                    funcPerm.getFunctionId(), criticalUsermasterMaints.size());
         }
 
-        Set<String> criticalRoles;
-        if ("AND".equalsIgnoreCase(functionLogic)) {
-            criticalRoles = functionRoleSets.stream()
-                    .reduce((set1, set2) -> {
-                        Set<String> intersection = new HashSet<>(set1);
-                        intersection.retainAll(set2);
-                        return intersection;
-                    })
-                    .orElse(new HashSet<>());
-        } else {
-            // Union - roles must satisfy ANY function
-            criticalRoles = functionRoleSets.stream()
-                    .flatMap(Set::stream)
-                    .collect(Collectors.toSet());
+        // Step 2: Find users/roles that have ALL required functions (SoD violation)
+        Set<String> violatingUsermasterMaints = findSoDViolations(functionToUsermasterMaints);
+
+        if (violatingUsermasterMaints.isEmpty()) {
+            log.info("No SoD violations found for risk: {}", riskDef.getRiskId());
+            return createEmptyResult();
         }
 
-        log.info("Found {} critical roles after applying {} logic", criticalRoles.size(), functionLogic);
+        log.info("Found {} violating authorizations", violatingUsermasterMaints.size());
 
-        // Step 3: Get all permissions for critical roles to extract profiles
-        Set<String> allObjects = request.getFunctions().stream()
-                .flatMap(f -> f.getCriteria().stream())
-                .map(Criteria::getObject)
-                .collect(Collectors.toSet());
+        // Step 3: Expand to all profiles (including composite profiles)
+        Set<String> allProfiles = expandToAllProfiles(clientId, violatingUsermasterMaints);
+        log.info("Expanded to {} profiles", allProfiles.size());
 
-        List<agr_1251> allPermissions = agrRepository.findByObjects(allObjects);
-
-        Map<String, List<agr_1251>> permissionsByRole = allPermissions.stream()
-                .filter(p -> criticalRoles.contains(p.getAgrName()))
-                .collect(Collectors.groupingBy(agr_1251::getAgrName));
-
-
-        List<RoleLevelOutput> roleOutputs = new ArrayList<>();
-        Map<String, Set<String>> profileToRolesMap = new HashMap<>();
-
-        for (String roleName : criticalRoles) {
-            roleOutputs.add(new RoleLevelOutput(
-                    request.getRiskId(),
-                    request.getDescription(),
-                    roleName
-            ));
-
-            List<agr_1251> rolePerms = permissionsByRole.getOrDefault(roleName, Collections.emptyList());
-            Set<String> profiles = extractProfiles(rolePerms);
-
-            for (String profile : profiles) {
-                profileToRolesMap.computeIfAbsent(profile, k -> new HashSet<>()).add(roleName);
-            }
-        }
-
-        // Step 5: Find users with these profiles
-        List<UserLevelOutput> userOutputs = findUsersWithProfiles(request, profileToRolesMap);
-
-        log.info("Found {} users with critical access", userOutputs.size());
-
-        return new AnalysisResult(roleOutputs, userOutputs);
-    }
-
-
-    private Set<String> evaluateFunction(FunctionRule function) {
-
-        List<List<Criteria>> criteriaGroups = parseCriteriaGroups(function.getCriteria());
-
-        // Get all relevant permissions
-        Set<String> objects = function.getCriteria().stream()
-                .map(Criteria::getObject)
-                .collect(Collectors.toSet());
-
-        List<agr_1251> allPermissions = agrRepository.findByObjects(objects);
-
-        // Group by role
-        Map<String, List<agr_1251>> permissionsByRole = allPermissions.stream()
-                .collect(Collectors.groupingBy(agr_1251::getAgrName));
-
-        // Evaluate each role
-        Set<String> qualifyingRoles = new HashSet<>();
-
-        for (Map.Entry<String, List<agr_1251>> entry : permissionsByRole.entrySet()) {
-            String roleName = entry.getKey();
-            List<agr_1251> rolePermissions = entry.getValue();
-
-            if (doesRoleSatisfyFunction(criteriaGroups, rolePermissions)) {
-                qualifyingRoles.add(roleName);
-            }
-        }
-
-        return qualifyingRoles;
-    }
-
-
-    private List<List<Criteria>> parseCriteriaGroups(List<Criteria> criteria) {
-        List<List<Criteria>> groups = new ArrayList<>();
-        List<Criteria> currentGroup = new ArrayList<>();
-
-        for (int i = 0; i < criteria.size(); i++) {
-            Criteria crit = criteria.get(i);
-            currentGroup.add(crit);
-
-            if (i == criteria.size() - 1 || "AND".equalsIgnoreCase(crit.getOperator())) {
-                groups.add(new ArrayList<>(currentGroup));
-                currentGroup.clear();
-            }
-        }
-
-        return groups;
-    }
-
-
-    private boolean doesRoleSatisfyFunction(List<List<Criteria>> criteriaGroups, List<agr_1251> rolePermissions) {
-        // Group permissions by AUTH (authorization object instance)
-        Map<String, List<agr_1251>> permsByAuth = rolePermissions.stream()
-                .filter(p -> p.getAuth() != null && !p.getAuth().isEmpty())
-                .collect(Collectors.groupingBy(agr_1251::getAuth));
-
-        // Check if ANY auth group satisfies ALL criteria groups
-        return permsByAuth.values().stream()
-                .anyMatch(authGroup -> {
-                    // ALL criteria groups must be satisfied in this auth group
-                    return criteriaGroups.stream().allMatch(group ->
-                            isCriteriaGroupSatisfiedInAuth(group, authGroup)
-                    );
-                });
-    }
-
-    /**
-     * Check if at least ONE criteria in the group is satisfied (OR logic)
-     */
-    private boolean isCriteriaGroupSatisfiedInAuth(List<Criteria> criteriaGroup, List<agr_1251> authGroup) {
-        return criteriaGroup.stream().anyMatch(criteria ->
-                authGroup.stream().anyMatch(perm -> matchesCriteria(perm, criteria))
+        // Step 4: Find users with these profiles
+        List<ust04> userAssignments = ust04Repository.findByClientAndProfiles(
+                clientId, new ArrayList<>(allProfiles)
         );
+
+        // Step 5: Find roles with these profiles
+        List<agr_prof> roleAssignments = agrProfRepository.findByClientAndProfiles(
+                clientId, new ArrayList<>(allProfiles)
+        );
+
+        // Step 6: Generate outputs
+        List<UserRiskOutput> userOutputs = generateUserOutputs(
+                riskDef, userAssignments, roleAssignments
+        );
+
+        List<RoleRiskOutput> roleOutputs = generateRoleOutputs(
+                riskDef, roleAssignments
+        );
+
+        Map<String, Object> result = new HashMap<>();
+        result.put("userLevelRisks", userOutputs);
+        result.put("roleLevelRisks", roleOutputs);
+        result.put("totalUsersAffected", userOutputs.size());
+        result.put("totalRolesAffected", roleOutputs.size());
+
+        return result;
     }
 
     /**
-     * Check if a permission matches a criteria
+     * Find critical authorizations based on complex conditions
      */
-    private boolean matchesCriteria(agr_1251 perm, Criteria criteria) {
-        // Check object matches
-        if (!criteria.getObject().equals(perm.getObject())) {
-            return false;
+    private Set<String> findCriticalAuthorizations(
+            String clientId,
+            List<AuthorizationCondition> conditions) {
+
+        // Group conditions by authorization object
+        Map<String, List<AuthorizationCondition>> conditionsByObject = conditions.stream()
+                .collect(Collectors.groupingBy(AuthorizationCondition::getAuthObj));
+
+        // For each object, find matching authorizations
+        Map<String, Set<String>> objectToUsermasterMaints = new HashMap<>();
+
+        for (Map.Entry<String, List<AuthorizationCondition>> entry : conditionsByObject.entrySet()) {
+            String authObj = entry.getKey();
+            List<AuthorizationCondition> objConditions = entry.getValue();
+
+            Set<String> matchingUsermasterMaints = findMatchingAuthorizationsForObject(
+                    clientId, authObj, objConditions
+            );
+            objectToUsermasterMaints.put(authObj, matchingUsermasterMaints);
         }
 
-        // Check field matches (if field is specified)
-        if (criteria.getField() != null && !criteria.getField().isEmpty()) {
-            if (!criteria.getField().equals(perm.getField())) {
-                return false;
+        // Combine results based on AND/OR logic between different auth objects
+        return combineAuthorizationResults(objectToUsermasterMaints, conditions);
+    }
+
+    /**
+     * Find matching authorizations for a single authorization object
+     */
+    private Set<String> findMatchingAuthorizationsForObject(
+            String clientId,
+            String authObj,
+            List<AuthorizationCondition> conditions) {
+
+        // Get all auth data for this object
+        List<ust12> allAuthData = new ArrayList<>();
+        for (AuthorizationCondition condition : conditions) {
+            List<ust12> data = ust12Repository.findByClientAndAuthObjAndField(
+                    clientId, authObj, condition.getField()
+            );
+            allAuthData.addAll(data);
+        }
+
+        // Group by usermaster_maint to check if all conditions are met within same auth
+        Map<String, List<ust12>> authsByUsermasterMaint = allAuthData.stream()
+                .collect(Collectors.groupingBy(ust12::getUsermasterMaint));
+
+        Set<String> result = new HashSet<>();
+
+        for (Map.Entry<String, List<ust12>> entry : authsByUsermasterMaint.entrySet()) {
+            String usermasterMaint = entry.getKey();
+            List<ust12> authRecords = entry.getValue();
+
+            // Check if this authorization satisfies the conditions
+            if (authMatchingService.matchesConditions(authRecords, conditions)) {
+                result.add(usermasterMaint);
             }
         }
 
-        // Check value matches
-        return matchesValue(perm, criteria.getValue());
+        return result;
     }
 
+    /**
+     * Combine results from different authorization objects
+     */
+    private Set<String> combineAuthorizationResults(
+            Map<String, Set<String>> objectToUsermasterMaints,
+            List<AuthorizationCondition> conditions) {
 
-    private boolean matchesValue(agr_1251 perm, String criteriaValue) {
-        String permLow = perm.getLow();
-        String permHigh = perm.getHigh();
-
-        if ("*".equals(permLow)) {
-            return true;
+        if (objectToUsermasterMaints.isEmpty()) {
+            return new HashSet<>();
         }
 
-        if ("*".equals(criteriaValue)) {
-            return "*".equals(permLow);
+        // For SoD analysis within a function, all conditions are typically AND
+        // (user must have ALL specified authorizations)
+        Set<String> result = null;
+
+        for (Set<String> usermasterMaints : objectToUsermasterMaints.values()) {
+            if (result == null) {
+                result = new HashSet<>(usermasterMaints);
+            } else {
+                result.retainAll(usermasterMaints); // AND operation
+            }
         }
 
-
-        boolean isRange = permHigh != null && !permHigh.isEmpty() && !permHigh.equals(permLow);
-
-        if (isRange) {
-            return criteriaValue.compareTo(permLow) >= 0 && criteriaValue.compareTo(permHigh) <= 0;
-        } else {
-            return permLow.equals(criteriaValue);
-        }
+        return result != null ? result : new HashSet<>();
     }
 
-
-    private Set<String> extractProfiles(List<agr_1251> permissions) {
-        return permissions.stream()
-                .map(agr_1251::getAuth)
-                .filter(auth -> auth != null && auth.length() > 2)
-                .map(auth -> auth.substring(0, auth.length() - 2))
-                .collect(Collectors.toSet());
-    }
-
-
-    private List<UserLevelOutput> findUsersWithProfiles(
-            RiskRequest request,
-            Map<String, Set<String>> profileToRolesMap) {
-
-        if (profileToRolesMap.isEmpty()) {
-            return Collections.emptyList();
+    /**
+     * Find authorizations that violate SoD (have all required functions)
+     */
+    private Set<String> findSoDViolations(Map<String, Set<String>> functionToUsermasterMaints) {
+        if (functionToUsermasterMaints.isEmpty()) {
+            return new HashSet<>();
         }
 
-        Set<String> allProfiles = profileToRolesMap.keySet();
-        List<ust04> users = ustRepository.findByProfileIn(allProfiles);
+        // Find intersection - users/auths that have ALL functions
+        Set<String> violations = null;
 
-        return users.stream()
-                .flatMap(user -> {
-                    Set<String> roles = profileToRolesMap.getOrDefault(user.getProfile(), Collections.emptySet());
-                    return roles.stream().map(role ->
-                            new UserLevelOutput(
-                                    request.getRiskId(),
-                                    request.getDescription(),
-                                    user.getBName(),
-                                    role,
-                                    user.getProfile()
-                            )
-                    );
-                })
+        for (Set<String> usermasterMaints : functionToUsermasterMaints.values()) {
+            if (violations == null) {
+                violations = new HashSet<>(usermasterMaints);
+            } else {
+                violations.retainAll(usermasterMaints);
+            }
+        }
+
+        return violations != null ? violations : new HashSet<>();
+    }
+
+    /**
+     * Expand usermaster_maint to all profiles including composite profiles
+     */
+    private Set<String> expandToAllProfiles(String clientId, Set<String> usermasterMaints) {
+        Set<String> allProfiles = new HashSet<>();
+
+        // Get direct profiles from UST10S
+        List<String> directProfiles = ust10sRepository.findProfilesByClientAndUsermasterMaints(
+                clientId, new ArrayList<>(usermasterMaints)
+        );
+        allProfiles.addAll(directProfiles);
+
+        // Add usermaster_maint values (they can also be profiles)
+        allProfiles.addAll(usermasterMaints);
+
+        // Expand composite profiles iteratively
+        Set<String> expandedProfiles = profileHierarchyService.expandCompositeProfiles(
+                clientId, allProfiles
+        );
+
+        return expandedProfiles;
+    }
+
+    private List<UserRiskOutput> generateUserOutputs(
+            RiskDefinition riskDef,
+            List<ust04> userAssignments,
+            List<agr_prof> roleAssignments) {
+
+        List<UserRiskOutput> outputs = new ArrayList<>();
+
+        // Create a map of profile -> roles for quick lookup
+        Map<String, List<String>> profileToRoles = roleAssignments.stream()
+                .collect(Collectors.groupingBy(
+                        agr_prof::getProfile,
+                        Collectors.mapping(agr_prof::getRoleName, Collectors.toList())
+                ));
+
+        for (ust04 userAssignment : userAssignments) {
+            List<String> roles = profileToRoles.getOrDefault(
+                    userAssignment.getProfile(),
+                    Collections.emptyList()
+            );
+
+            if (roles.isEmpty()) {
+                // User has profile but no role mapping
+                outputs.add(UserRiskOutput.builder()
+                        .riskId(riskDef.getRiskId())
+                        .description(riskDef.getDescription())
+                        .userId(userAssignment.getBName())
+                        .roleName("N/A")
+                        .profile(userAssignment.getProfile())
+                        .riskLevel(riskDef.getRiskLevel())
+                        .riskType(riskDef.getRiskType())
+                        .build());
+            } else {
+                for (String role : roles) {
+                    outputs.add(UserRiskOutput.builder()
+                            .riskId(riskDef.getRiskId())
+                            .description(riskDef.getDescription())
+                            .userId(userAssignment.getBName())
+                            .roleName(role)
+                            .profile(userAssignment.getProfile())
+                            .riskLevel(riskDef.getRiskLevel())
+                            .riskType(riskDef.getRiskType())
+                            .build());
+                }
+            }
+        }
+
+        return outputs;
+    }
+
+    private List<RoleRiskOutput> generateRoleOutputs(
+            RiskDefinition riskDef,
+            List<agr_prof> roleAssignments) {
+
+        return roleAssignments.stream()
+                .map(agr -> RoleRiskOutput.builder()
+                        .riskId(riskDef.getRiskId())
+                        .description(riskDef.getDescription())
+                        .roleId(agr.getRoleName())
+                        .riskLevel(riskDef.getRiskLevel())
+                        .riskType(riskDef.getRiskType())
+                        .build())
+                .distinct()
                 .collect(Collectors.toList());
+    }
+
+    private Map<String, Object> createEmptyResult() {
+        Map<String, Object> result = new HashMap<>();
+        result.put("userLevelRisks", Collections.emptyList());
+        result.put("roleLevelRisks", Collections.emptyList());
+        result.put("totalUsersAffected", 0);
+        result.put("totalRolesAffected", 0);
+        return result;
     }
 }

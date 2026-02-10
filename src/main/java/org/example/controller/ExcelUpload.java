@@ -7,20 +7,22 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 @RestController
-@RequestMapping("/api/excel")
+@RequestMapping("/api/v1/upload")
 public class ExcelUpload {
 
-    @Autowired private ExcelUploadService uploadService;
+    @Autowired
+    private ExcelUploadService uploadService;
 
-    @PostMapping("/upload")
-    public ResponseEntity<String> uploadFile(
-            @RequestParam("file") MultipartFile file,
-            @RequestParam("type") String type) {
+    @PostMapping("/{type}")
+    public ResponseEntity<String> uploadExcel(
+            @PathVariable String type,
+            @RequestParam("file") MultipartFile file) {
         try {
             uploadService.uploadExcel(file, type);
-            return ResponseEntity.ok("File uploaded and data saved successfully!");
+            return ResponseEntity.ok("Successfully uploaded " + type + " data");
         } catch (Exception e) {
-            return ResponseEntity.status(500).body("Error: " + e.getMessage());
+            return ResponseEntity.badRequest()
+                    .body("Upload failed: " + e.getMessage());
         }
     }
 }

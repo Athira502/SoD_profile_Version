@@ -2,10 +2,8 @@ package org.example.service;
 
 import org.apache.poi.ss.usermodel.*;
 import org.apache.poi.util.IOUtils;
-import org.example.model.agr_1251;
-import org.example.model.ust04;
-import org.example.repository.agr_1251Repo;
-import org.example.repository.ust04Repo;
+import org.example.model.*;
+import org.example.repository.*;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -15,12 +13,25 @@ import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
 
-@Transactional
 @Service
+@Transactional
 public class ExcelUploadService {
 
-    @Autowired private agr_1251Repo agrRepository;
-    @Autowired private ust04Repo ustRepository;
+
+    @Autowired
+    private Ust04Repository ust04Repository;
+
+    @Autowired
+    private AgrProfRepository agrProfRepository;
+
+    @Autowired
+    private Ust10cRepository ust10cRepository;
+
+    @Autowired
+    private Ust10sRepository ust10sRepository;
+
+    @Autowired
+    private Ust12Repository ust12Repository;
 
     private final DataFormatter dataFormatter = new DataFormatter();
 
@@ -34,51 +45,155 @@ public class ExcelUploadService {
             Sheet sheet = workbook.getSheetAt(0);
             int rowCount = 0;
 
-            if ("AGR".equalsIgnoreCase(type)) {
-                List<agr_1251> list = new ArrayList<>();
-                for (Row row : sheet) {
-                    if (row.getRowNum() == 0) continue; // Skip header
+            switch (type.toUpperCase()) {
 
-
-                    String firstCell = getCellValue(row, 0);
-                    if (firstCell == null || firstCell.trim().isEmpty()) continue;
-
-                    agr_1251 entity = agr_1251.builder()
-                            .mandt(firstCell)
-                            .agrName(getCellValue(row, 1))
-                            .counter(parseInteger(getCellValue(row, 2)))
-                            .object(getCellValue(row, 3))
-                            .auth(getCellValue(row, 4))
-                            .variant(getCellValue(row, 5)) // Indices must be exact!
-                            .field(getCellValue(row, 6))
-                            .low(getCellValue(row, 7))
-                            .build();
-                    list.add(entity);
-                    rowCount++;
-                }
-                agrRepository.saveAll(list);
-                System.out.println(">>> SUCCESSFULLY SAVED " + rowCount + " ROWS TO AGR_1251");
-
-            } else if ("UST".equalsIgnoreCase(type)) {
-                List<ust04> list = new ArrayList<>();
-                for (Row row : sheet) {
-                    if (row.getRowNum() == 0) continue;
-
-                    String firstCell = getCellValue(row, 0);
-                    if (firstCell == null || firstCell.trim().isEmpty()) continue;
-
-                    ust04 entity = ust04.builder()
-                            .mandt(firstCell)
-                            .bName(getCellValue(row, 1))
-                            .profile(getCellValue(row, 2))
-                            .build();
-                    list.add(entity);
-                    rowCount++;
-                }
-                ustRepository.saveAll(list);
-                System.out.println(">>> SUCCESSFULLY SAVED " + rowCount + " ROWS TO UST04");
+                case "UST04":
+                    rowCount = uploadUst04(sheet);
+                    break;
+                case "AGR_PROF":
+                    rowCount = uploadAgrProf(sheet);
+                    break;
+                case "UST10C":
+                    rowCount = uploadUst10c(sheet);
+                    break;
+                case "UST10S":
+                    rowCount = uploadUst10s(sheet);
+                    break;
+                case "UST12":
+                    rowCount = uploadUst12(sheet);
+                    break;
+                default:
+                    throw new IllegalArgumentException("Unknown type: " + type);
             }
+
+            System.out.println(">>> SUCCESSFULLY SAVED " + rowCount + " ROWS TO " + type.toUpperCase());
         }
+    }
+
+
+
+    private int uploadUst04(Sheet sheet) {
+        List<ust04> list = new ArrayList<>();
+        int rowCount = 0;
+
+        for (Row row : sheet) {
+            if (row.getRowNum() == 0) continue; // Skip header
+
+            String firstCell = getCellValue(row, 0);
+            if (firstCell == null || firstCell.trim().isEmpty()) continue;
+
+            ust04 entity = ust04.builder()
+                    .mandt(firstCell)
+                    .bName(getCellValue(row, 1))
+                    .profile(getCellValue(row, 2))
+                    .build();
+            list.add(entity);
+            rowCount++;
+        }
+
+        ust04Repository.saveAll(list);
+        return rowCount;
+    }
+
+    private int uploadAgrProf(Sheet sheet) {
+        List<agr_prof> list = new ArrayList<>();
+        int rowCount = 0;
+
+        for (Row row : sheet) {
+            if (row.getRowNum() == 0) continue; // Skip header
+
+            String firstCell = getCellValue(row, 0);
+            if (firstCell == null || firstCell.trim().isEmpty()) continue;
+
+            agr_prof entity = agr_prof.builder()
+                    .mandt(firstCell)
+                    .roleName(getCellValue(row, 1))
+                    .language(getCellValue(row, 2))
+                    .profile(getCellValue(row, 3))
+                    .text(getCellValue(row, 4))
+                    .build();
+            list.add(entity);
+            rowCount++;
+        }
+
+        agrProfRepository.saveAll(list);
+        return rowCount;
+    }
+
+    private int uploadUst10c(Sheet sheet) {
+        List<ust10c> list = new ArrayList<>();
+        int rowCount = 0;
+
+        for (Row row : sheet) {
+            if (row.getRowNum() == 0) continue; // Skip header
+
+            String firstCell = getCellValue(row, 0);
+            if (firstCell == null || firstCell.trim().isEmpty()) continue;
+
+            ust10c entity = ust10c.builder()
+                    .client(firstCell)
+                    .compProfile(getCellValue(row, 1))
+                    .version(getCellValue(row, 2))
+                    .singProfile(getCellValue(row, 3))
+                    .build();
+            list.add(entity);
+            rowCount++;
+        }
+
+        ust10cRepository.saveAll(list);
+        return rowCount;
+    }
+
+    private int uploadUst10s(Sheet sheet) {
+        List<ust10s> list = new ArrayList<>();
+        int rowCount = 0;
+
+        for (Row row : sheet) {
+            if (row.getRowNum() == 0) continue; // Skip header
+
+            String firstCell = getCellValue(row, 0);
+            if (firstCell == null || firstCell.trim().isEmpty()) continue;
+
+            ust10s entity = ust10s.builder()
+                    .client(firstCell)
+                    .profile(getCellValue(row, 1))
+                    .version(getCellValue(row, 2))
+                    .authObj(getCellValue(row, 3))
+                    .usermasterMaint(getCellValue(row, 4))
+                    .build();
+            list.add(entity);
+            rowCount++;
+        }
+
+        ust10sRepository.saveAll(list);
+        return rowCount;
+    }
+
+    private int uploadUst12(Sheet sheet) {
+        List<ust12> list = new ArrayList<>();
+        int rowCount = 0;
+
+        for (Row row : sheet) {
+            if (row.getRowNum() == 0) continue; // Skip header
+
+            String firstCell = getCellValue(row, 0);
+            if (firstCell == null || firstCell.trim().isEmpty()) continue;
+
+            ust12 entity = ust12.builder()
+                    .client(firstCell)
+                    .authObj(getCellValue(row, 1))
+                    .usermasterMaint(getCellValue(row, 2))
+                    .version(getCellValue(row, 3))
+                    .authField(getCellValue(row, 4))
+                    .low(getCellValue(row, 5))
+                    .high(getCellValue(row, 6))
+                    .build();
+            list.add(entity);
+            rowCount++;
+        }
+
+        ust12Repository.saveAll(list);
+        return rowCount;
     }
 
     private String getCellValue(Row row, int cellIndex) {
