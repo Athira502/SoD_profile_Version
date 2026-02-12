@@ -33,6 +33,9 @@ public class ExcelUploadService {
     @Autowired
     private Ust12Repository ust12Repository;
 
+    @Autowired
+    private AgrDefineRepository agrDefineRepository;
+
     private final DataFormatter dataFormatter = new DataFormatter();
 
     @Transactional
@@ -61,6 +64,9 @@ public class ExcelUploadService {
                     break;
                 case "UST12":
                     rowCount = uploadUst12(sheet);
+                    break;
+                case "AGR_DEFINE":
+                    rowCount = uploadAgrDefine(sheet);
                     break;
                 default:
                     throw new IllegalArgumentException("Unknown type: " + type);
@@ -193,6 +199,28 @@ public class ExcelUploadService {
         }
 
         ust12Repository.saveAll(list);
+        return rowCount;
+    }
+
+    private int uploadAgrDefine(Sheet sheet) {
+        List<agr_define> list = new ArrayList<>();
+        int rowCount = 0;
+
+        for (Row row : sheet) {
+            if (row.getRowNum() == 0) continue; // Skip header
+
+            String firstCell = getCellValue(row, 0);
+            if (firstCell == null || firstCell.trim().isEmpty()) continue;
+
+            agr_define entity = agr_define.builder()
+                    .mandt(firstCell)
+                    .roleName(getCellValue(row, 1))
+                    .build();
+            list.add(entity);
+            rowCount++;
+        }
+
+        agrDefineRepository.saveAll(list);
         return rowCount;
     }
 

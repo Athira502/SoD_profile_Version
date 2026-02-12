@@ -21,6 +21,7 @@ public class RiskAnalysisService {
     private final Ust10sRepository ust10sRepository;
     private final Ust10cRepository ust10cRepository;
     private final Ust04Repository ust04Repository;
+    private final AgrDefineRepository agrDefineRepository;
     private final AgrProfRepository agrProfRepository;
     private final AuthorizationMatchingService authMatchingService;
     private final ProfileHierarchyService profileHierarchyService;
@@ -74,8 +75,13 @@ public class RiskAnalysisService {
         );
 
         List<RoleRiskOutput> roleOutputs = generateRoleOutputs(
-                riskDef, roleAssignments
+                riskDef, roleAssignments, clientId
         );
+
+        long uniqueUserCount = userAssignments.stream()
+                .map(ust04::getBName)
+                .distinct()
+                .count();
 
         Map<String, Object> result = new HashMap<>();
         result.put("userLevelRisks", userOutputs);
@@ -272,9 +278,29 @@ public class RiskAnalysisService {
 
     private List<RoleRiskOutput> generateRoleOutputs(
             RiskDefinition riskDef,
-            List<agr_prof> roleAssignments) {
+            List<agr_prof> roleAssignments,
+            String clientId) {
 
-        return roleAssignments.stream()
+        if (roleAssignments.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        // Get all unique role names from roleAssignments
+        List<String> allRoleNames = roleAssignments.stream()
+                .map(agr_prof::getRoleName)
+                .distinct()
+                .collect(Collectors.toList());
+
+        log.info("Found {} unique roles from agr_prof", allRoleNames.size());
+
+        // Validate roles against agr_define table
+        Set<String> validRoles = agrDefineRepository.findExistingRoles(clientId, allRoleNames);
+
+        log.info("Validated {} roles exist in agr_define", validRoles.size());
+
+        // Filter and generate outputs only for valid roles
+        List<RoleRiskOutput> outputs = roleAssignments.stream()
+                .filter(agr -> validRoles.contains(agr.getRoleName())) // Only include valid roles
                 .map(agr -> RoleRiskOutput.builder()
                         .riskId(riskDef.getRiskId())
                         .description(riskDef.getDescription())
@@ -284,6 +310,13 @@ public class RiskAnalysisService {
                         .build())
                 .distinct()
                 .collect(Collectors.toList());
+
+        if (validRoles.size() < allRoleNames.size()) {
+            log.warn("Filtered out {} roles that don't exist in agr_define",
+                    allRoleNames.size() - validRoles.size());
+        }
+
+        return outputs;
     }
 
     private Map<String, Object> createEmptyResult() {
